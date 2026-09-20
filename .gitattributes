@@ -1,0 +1,8 @@
+* text=auto eol=lf
+firmware/epaper_calendar/Display_EPD_W21.cpp -text
+firmware/epaper_calendar/Display_EPD_W21.h -text
+firmware/epaper_calendar/Display_EPD_W21_spi.cpp -text
+firmware/epaper_calendar/Display_EPD_W21_spi.h -text
+firmware/epaper_calendar/image.h -text
+vendor/*.zip -text
+docs/*.png -text
