@@ -21,12 +21,16 @@ DS3231 默认接在 GPIO21（SDA）和 GPIO22（SCL），这是 LOLIN32 的默�
 ## 每年一次：生成并写入页面
 
 ```sh
-python3 -m pip install --user -r scripts/requirements.txt   # Pillow、pyserial
+python3 -m pip install --user -r scripts/requirements.txt   # Pillow、pyserial（见下方说明）
 
 python3 scripts/generate_pages.py --start 2026-11-09         # 365 张 PNG + fallback.png → .build/pages/
 python3 scripts/pack_calendar.py .build/pages                # 压缩打包 → .build/calendar-data.bin
 scripts/compile.sh                                           # 编译固件（不上传）
 ```
+
+Homebrew 安装的 Python 默认禁止直接用 pip 装包（PEP 668），上面的命令会报 `externally-managed-environment`。解决办法二选一：
+- 在命令末尾加上 `--break-system-packages`：包只会装进用户目录 `~/Library/Python/`，不会改动 Homebrew 的 Python；
+- 或者先建一个虚拟环境（`python3 -m venv .venv && source .venv/bin/activate`），然后去掉 `--user` 再安装。
 
 连接开发板后：
 
@@ -47,9 +51,11 @@ python3 scripts/set_rtc.py /dev/cu.usbserial-XXXX
 
 ### 页面与容量
 
-- `generate_pages.py` 生成的是一个基础版式：左侧显示大号日期和星期，右侧显示月历，当天用蓝色圆点标出，周末为红色。字体默认使用 macOS 自带的冬青黑体，可以用 `--font` 更换。还没有农历和节假日。
+- `generate_pages.py` 默认使用**黄历风**（`--style almanac`）：大号衬线日期；竖排红色农历印章；节气和节日用黄色标签；底部显示一年中的第几天，以及距离下一个重要节日还有几天。周末和重要节日的日期显示为红色。另外两种风格是月历风 `--style grid`（左侧当天日期，右侧带农历的整月月历）和海报风 `--style poster`（整版色块，底部显示本周七天）。
+- 农历来自 macOS 自带的中国历法（`calendar_info.py` 通过 JavaScript for Automation 调用），干支、生肖、闰月都能正确处理。节气根据太阳视黄经计算，误差约 15 分钟，如果某个节气恰好落在零点前后几分钟，日期可能差一天。节日包括春节、除夕、元宵、端午、七夕、中秋、重阳等传统节日，以及元旦、劳动节、国庆、母亲节等公历节日。**国务院每年公布的放假和调休安排没有包含**。
+- 页面用到的字体都是 macOS 自带的：宋体、冬青黑体、Bodoni 72、DIN Condensed、Futura。文字不做抗锯齿，渲染出来的每个像素都正好是六色之一。
 - 也可以用其他工具设计页面。只要文件名是 `YYYY-MM-DD.png`，尺寸是 800 × 480，放进同一个目录即可。`fallback.png` 用于时钟未设置或缺少当天页面的情况。
-- 每张页面压缩后约 5 KB，365 天约 1.75 MB，数据分区容量是 2.75 MB（2,818,048 字节）。照片类页面每张约 85 KB，放不下一整年。`pack_calendar.py` 会打印用量，超出容量时直接报错。
+- 黄历风每张页面压缩后约 4 KB，365 天约 1.47 MB，数据分区容量是 2.75 MB（2,818,048 字节）。照片类页面每张约 85 KB，放不下一整年。`pack_calendar.py` 会打印用量，超出容量时直接报错。
 - `pack_calendar.py` 支持 `--fit`、`--rotate`、`--dither`，含义和 `convert_image.py` 相同。
 
 ## 固件行为

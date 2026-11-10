@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Render one 800 x 480 calendar page per day, plus fallback.png.
 
-Output feeds pack_calendar.py. Colors are the panel's six pure colors so
-quantization keeps them exact; only anti-aliased text edges are approximated.
+Output feeds pack_calendar.py. Pages use only the panel's six pure colors and
+text is drawn without anti-aliasing, so quantization keeps every pixel exact.
+Lunar dates, solar terms and festivals come from calendar_info.py.
 """
 
 import argparse
-import calendar
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -16,78 +16,255 @@ try:
 except ImportError:
     sys.exit("Pillow is required: python3 -m pip install --user -r scripts/requirements.txt")
 
+import calendar_info as info
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = ROOT / ".build/pages"
-DEFAULT_FONT = "/System/Library/Fonts/Hiragino Sans GB.ttc"
 
 WIDTH, HEIGHT = 800, 480
 BLACK, WHITE, YELLOW = (0, 0, 0), (255, 255, 255), (255, 255, 0)
-RED, BLUE = (255, 0, 0), (0, 0, 255)
-WEEKDAYS = "一二三四五六日"
+RED, BLUE, GREEN = (255, 0, 0), (0, 0, 255), (0, 255, 0)
+
+_SYS = "/System/Library/Fonts/"
+_SUP = _SYS + "Supplemental/"
+FACES = {
+    "song_black": (_SUP + "Songti.ttc", 0),
+    "song_bold": (_SUP + "Songti.ttc", 1),
+    "hei": (_SYS + "Hiragino Sans GB.ttc", 0),
+    "hei_bold": (_SYS + "Hiragino Sans GB.ttc", 2),
+    "din": (_SUP + "DIN Condensed Bold.ttf", 0),
+    "bodoni": (_SUP + "Bodoni 72.ttc", 2),
+    "futura_xb": (_SUP + "Futura.ttc", 4),
+    "avenir_demi": (_SYS + "Avenir Next Condensed.ttc", 2),
+}
+MONTHS_EN = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+             "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]
+WEEKDAYS_EN = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+MONTHS_CN = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二"]
+
+_font_cache = {}
 
 
-class Fonts:
-    def __init__(self, path):
-        self.path = path
-        self.cache = {}
-
-    def __call__(self, size):
-        if size not in self.cache:
-            self.cache[size] = ImageFont.truetype(self.path, size)
-        return self.cache[size]
+def font(face, size):
+    key = (face, size)
+    if key not in _font_cache:
+        path, index = FACES[face]
+        _font_cache[key] = ImageFont.truetype(path, size, index=index)
+    return _font_cache[key]
 
 
-def centered(draw, box, text, font, fill):
-    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-    x = box[0] + (box[2] - box[0] - (right - left)) / 2 - left
-    y = box[1] + (box[3] - box[1] - (bottom - top)) / 2 - top
-    draw.text((x, y), text, font=font, fill=fill)
-
-
-def render_day(day, font):
-    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+def canvas(color=WHITE):
+    image = Image.new("RGB", (WIDTH, HEIGHT), color)
     draw = ImageDraw.Draw(image)
+    draw.fontmode = "1"  # No anti-aliasing: every pixel stays one of the six colors.
+    return image, draw
 
-    # Left panel: month, day number, weekday.
-    draw.rectangle((0, 0, 299, HEIGHT), fill=RED)
-    centered(draw, (0, 20, 300, 80), f"{day.year}年{day.month}月", font(36), WHITE)
-    centered(draw, (0, 90, 300, 330), str(day.day), font(190), WHITE)
-    centered(draw, (0, 340, 300, 390), f"星期{WEEKDAYS[day.weekday()]}", font(34), WHITE)
-    day_of_year = day.timetuple().tm_yday
-    centered(draw, (0, 400, 300, 440), f"第 {day_of_year} 天", font(24), YELLOW)
 
-    # Right panel: month grid with today highlighted, weekends in red.
-    cell_w, cell_h, left, top = 66, 62, 320, 20
-    for col, name in enumerate(WEEKDAYS):
-        centered(draw, (left + col * cell_w, top, left + (col + 1) * cell_w, top + 44),
-                 name, font(24), RED if col >= 5 else BLACK)
-    draw.line((left + 8, top + 50, left + 7 * cell_w - 8, top + 50), fill=BLACK, width=2)
-    weeks = calendar.monthcalendar(day.year, day.month)
-    row_h = min(cell_h, (HEIGHT - top - 64) // len(weeks))
-    for row, week in enumerate(weeks):
-        for col, number in enumerate(week):
-            if not number:
-                continue
-            box = (left + col * cell_w, top + 60 + row * row_h,
-                   left + (col + 1) * cell_w, top + 60 + (row + 1) * row_h)
-            color = RED if col >= 5 else BLACK
-            if number == day.day:
-                cx, cy, r = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2, min(row_h, cell_w) / 2 - 3
-                draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=BLUE)
-                color = WHITE
-            centered(draw, box, str(number), font(28), color)
+def vertical(draw, x, y, text, face, size, fill, spacing=1.08):
+    """Top-to-bottom CJK text centered on column x, starting at y."""
+    for i, ch in enumerate(text):
+        draw.text((x, y + i * size * spacing + size / 2), ch, font=font(face, size), fill=fill,
+                  anchor="mm")
+
+
+def pill(draw, center, text, face, size, fill, background, pad=(14, 6)):
+    left, top, right, bottom = draw.textbbox(center, text, font=font(face, size), anchor="mm")
+    draw.rounded_rectangle((left - pad[0], top - pad[1], right + pad[0], bottom + pad[1]),
+                           radius=(bottom - top) // 2 + pad[1], fill=background)
+    draw.text(center, text, font=font(face, size), fill=fill, anchor="mm")
+
+
+def next_major(today, lookahead):
+    for later in lookahead:
+        if later.day > today.day and later.major:
+            return later
+    return None
+
+
+# --- Style: almanac (黄历) -------------------------------------------------
+
+def almanac(today, lookahead, month):
+    image, draw = canvas()
+    accent = RED if today.weekend or today.major else BLACK
+    d = today.day
+
+    # Header.
+    draw.text((40, 44), str(d.year), font=font("bodoni", 34), fill=BLACK, anchor="ls")
+    draw.text((400, 44), f"{MONTHS_CN[d.month - 1]}月  {MONTHS_EN[d.month - 1]}",
+              font=font("song_bold", 26), fill=BLACK, anchor="ms")
+    draw.text((760, 44), f"{today.lunar.year_name}{today.lunar.zodiac}年",
+              font=font("song_bold", 26), fill=BLACK, anchor="rs")
+    draw.rectangle((40, 60, 760, 63), fill=BLACK)
+    draw.rectangle((40, 67, 760, 67), fill=BLACK)
+
+    # Giant day number and weekday.
+    draw.text((300, 268), str(d.day), font=font("bodoni", 300), fill=accent, anchor="mm")
+    draw.text((300, 420), f"{today.weekday_name}", font=font("song_black", 34), fill=accent,
+              anchor="rs")
+    draw.text((312, 420), WEEKDAYS_EN[d.weekday()], font=font("bodoni", 26), fill=accent,
+              anchor="ls")
+
+    # Lunar seal: red block with vertical white text.
+    seal_text = today.lunar.month_name + today.lunar.day_name
+    seal_h = 34 + len(seal_text) * 50
+    draw.rectangle((590, 96, 680, 96 + seal_h), fill=RED)
+    vertical(draw, 635, 113, seal_text, "song_black", 46, WHITE)
+    draw.text((635, 96 + seal_h + 30), "农历", font=font("song_bold", 22), fill=BLACK,
+              anchor="mm")
+    if today.highlight:
+        pill(draw, (635, 96 + seal_h + 74), today.highlight, "song_black", 28, BLACK, YELLOW)
+
+    # Footer: day of year and countdown to the next major day.
+    draw.rectangle((40, 444, 760, 445), fill=BLACK)
+    draw.text((40, 468), f"{d.year} 年第 {d.timetuple().tm_yday} 天", font=font("hei", 18),
+              fill=BLACK, anchor="ls")
+    upcoming = next_major(today, lookahead)
+    if upcoming:
+        days = (upcoming.day - d).days
+        draw.text((760, 468), f"距{upcoming.highlight}还有 {days} 天", font=font("hei_bold", 18),
+                  fill=RED, anchor="rs")
     return image
 
 
-def render_fallback(font):
-    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
-    draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, WIDTH, 120), fill=BLUE)
-    centered(draw, (0, 0, WIDTH, 120), "电子日历", font(56), WHITE)
-    centered(draw, (0, 170, WIDTH, 250), "暂时无法显示今天的页面", font(44), BLACK)
-    centered(draw, (0, 280, WIDTH, 330), "时钟未设置，或没有这一天的图片", font(30), RED)
-    centered(draw, (0, 350, WIDTH, 400), "请连接电脑运行 scripts/set_rtc.py 校时", font(26), BLACK)
+# --- Style: month grid (月历) ---------------------------------------------
+
+def grid(today, lookahead, month):
+    image, draw = canvas()
+    d = today.day
+
+    # Left panel: yellow block with the day.
+    draw.rectangle((0, 0, 270, HEIGHT), fill=YELLOW)
+    draw.text((32, 56), f"{d.month:02d}", font=font("din", 44), fill=BLACK, anchor="ls")
+    draw.text((84, 56), f"/ {MONTHS_EN[d.month - 1][:3]}", font=font("din", 30), fill=BLACK,
+              anchor="ls")
+    draw.text((135, 236), f"{d.day:02d}", font=font("din", 250), fill=BLACK, anchor="mm")
+    draw.rectangle((32, 330, 238, 333), fill=BLACK)
+    draw.text((32, 378), today.weekday_name, font=font("song_black", 36), fill=BLACK, anchor="ls")
+    draw.text((32, 418), f"农历{today.lunar.month_name}{today.lunar.day_name}",
+              font=font("hei_bold", 22), fill=BLACK, anchor="ls")
+    if today.highlight:
+        draw.rectangle((32, 432, 32 + 30 * len(today.highlight) + 20, 466), fill=RED)
+        draw.text((42, 459), today.highlight, font=font("hei_bold", 24), fill=WHITE, anchor="ls")
+
+    # Right: month header and grid with lunar labels.
+    left, cell_w = 300, 68
+    draw.text((left, 56), f"{d.year}", font=font("din", 44), fill=BLACK, anchor="ls")
+    draw.text((left + 90, 56), f"{MONTHS_CN[d.month - 1]}月", font=font("song_black", 30),
+              fill=BLACK, anchor="ls")
+    draw.text((left + 7 * cell_w - 12, 56), f"{today.lunar.year_name}{today.lunar.zodiac}年",
+              font=font("hei", 20), fill=BLACK, anchor="rs")
+    for col, name in enumerate(info.WEEKDAYS):
+        draw.text((left + col * cell_w + cell_w / 2, 96), name, font=font("hei_bold", 20),
+                  fill=RED if col >= 5 else BLACK, anchor="ms")
+    draw.rectangle((left + 6, 106, left + 7 * cell_w - 6, 107), fill=BLACK)
+
+    first_col = month[0].day.weekday()
+    rows = (first_col + len(month) + 6) // 7
+    row_h = min(62, (HEIGHT - 120 - 10) // rows)
+    for item in month:
+        index = first_col + item.day.day - 1
+        col, row = index % 7, index // 7
+        cx = left + col * cell_w + cell_w / 2
+        top = 116 + row * row_h
+        is_today = item.day == d
+        number_color = RED if col >= 5 or item.major else BLACK
+        label_color = RED if item.highlight else BLACK
+        if is_today:
+            draw.rectangle((cx - cell_w / 2 + 3, top, cx + cell_w / 2 - 3, top + row_h - 6),
+                           fill=BLACK)
+            number_color = label_color = YELLOW
+        draw.text((cx, top + 32), str(item.day.day), font=font("din", 32), fill=number_color,
+                  anchor="ms")
+        label = item.short_label
+        draw.text((cx, top + 51), label if len(label) <= 3 else label[:3],
+                  font=font("hei", 14), fill=label_color, anchor="ms")
     return image
+
+
+# --- Style: poster (海报) -------------------------------------------------
+
+def poster(today, lookahead, month):
+    d = today.day
+    background = RED if today.weekend or today.major else BLUE
+    image, draw = canvas(background)
+
+    draw.text((40, 62), f"{d.year}.{d.month:02d}", font=font("din", 46), fill=WHITE, anchor="ls")
+    draw.text((760, 58), f"{today.lunar.year_name}{today.lunar.zodiac}年",
+              font=font("song_black", 30), fill=WHITE, anchor="rs")
+
+    # Giant number on the left, text block on the right.
+    draw.text((210, 236), str(d.day), font=font("futura_xb", 290), fill=WHITE, anchor="mm")
+    draw.text((430, 190), today.weekday_name, font=font("song_black", 64), fill=WHITE,
+              anchor="ls")
+    draw.text((432, 244), f"农历{today.lunar.month_name}{today.lunar.day_name}",
+              font=font("song_bold", 34), fill=YELLOW, anchor="ls")
+    if today.highlight:
+        left, top, right, bottom = draw.textbbox((432, 304), today.highlight,
+                                                 font=font("song_black", 40), anchor="ls")
+        draw.rectangle((left - 12, top - 10, right + 12, bottom + 10), fill=YELLOW)
+        draw.text((432, 304), today.highlight, font=font("song_black", 40), fill=BLACK,
+                  anchor="ls")
+
+    # Week strip.
+    monday = d - timedelta(days=d.weekday())
+    by_day = {m.day: m for m in month + lookahead}
+    cell_w, top, bottom = 96, 372, 452
+    left = (WIDTH - 7 * cell_w) // 2 + 4
+    for i in range(7):
+        day = monday + timedelta(days=i)
+        x0 = left + i * cell_w
+        box = (x0 + 4, top, x0 + cell_w - 4, bottom)
+        if day == d:
+            draw.rectangle(box, fill=YELLOW)
+            fg = BLACK
+        else:
+            draw.rectangle(box, outline=WHITE, width=2)
+            fg = WHITE
+        cx = (box[0] + box[2]) / 2
+        draw.text((cx, top + 26), info.WEEKDAYS[i], font=font("hei_bold", 18), fill=fg,
+                  anchor="ms")
+        draw.text((cx, top + 66), str(day.day), font=font("din", 38), fill=fg, anchor="ms")
+        item = by_day.get(day)
+        if item and item.highlight and day != d:
+            draw.rectangle((box[2] - 12, top + 6, box[2] - 6, top + 12), fill=YELLOW)
+    return image
+
+
+STYLES = {"almanac": almanac, "grid": grid, "poster": poster}
+
+
+def render_fallback():
+    """Shown when the clock is unset or a date has no page; matches the almanac style."""
+    image, draw = canvas()
+    draw.text((40, 44), "电子日历", font=font("song_black", 30), fill=BLACK, anchor="ls")
+    draw.rectangle((40, 60, 760, 63), fill=BLACK)
+    draw.rectangle((40, 67, 760, 67), fill=BLACK)
+
+    draw.rectangle((70, 120, 160, 120 + 34 + 4 * 50), fill=RED)
+    vertical(draw, 115, 137, "等待校时", "song_black", 46, WHITE)
+
+    draw.text((210, 190), "暂时无法显示今天的页面", font=font("song_black", 44), fill=BLACK,
+              anchor="ls")
+    draw.text((210, 240), "时钟未设置，或没有这一天的图片", font=font("hei_bold", 26), fill=RED,
+              anchor="ls")
+    draw.text((210, 312), "连接电脑后运行：", font=font("hei", 22), fill=BLACK, anchor="ls")
+    pill(draw, (420, 360), "python3 scripts/set_rtc.py", "din", 32, BLACK, YELLOW, pad=(18, 8))
+
+    draw.rectangle((40, 444, 760, 445), fill=BLACK)
+    draw.text((760, 468), "其余命令见 README", font=font("hei", 18), fill=BLACK, anchor="rs")
+    return image
+
+
+def render_range(start, days, style):
+    """Yield (date, image) for each day, sharing calendar lookups."""
+    lookahead = info.build(start, days + 400)
+    months = {}
+    for offset in range(days):
+        today = lookahead[offset]
+        key = (today.day.year, today.day.month)
+        if key not in months:
+            months[key] = info.month_days(*key)
+        yield today.day, STYLES[style](today, lookahead[offset + 1:offset + 400], months[key])
 
 
 def main(argv=None):
@@ -96,22 +273,22 @@ def main(argv=None):
     parser.add_argument("--start", type=date.fromisoformat, default=date.today(),
                         help="first day, YYYY-MM-DD (default: today)")
     parser.add_argument("--days", type=int, default=365, help="number of days (default: 365)")
-    parser.add_argument("--font", default=DEFAULT_FONT, help="TrueType/OpenType font with CJK glyphs")
+    parser.add_argument("--style", choices=sorted(STYLES), default="almanac")
     args = parser.parse_args(argv)
 
     try:
-        font = Fonts(args.font)
-        font(12)
+        for face in FACES:
+            font(face, 12)
     except OSError as error:
-        parser.exit(1, f"error: cannot load font {args.font}: {error}\n")
+        parser.exit(1, f"error: missing macOS font: {error}\n")
 
     args.output.mkdir(parents=True, exist_ok=True)
-    render_fallback(font).save(args.output / "fallback.png")
-    for offset in range(args.days):
-        day = args.start + timedelta(days=offset)
-        render_day(day, font).save(args.output / f"{day.isoformat()}.png")
+    render_fallback().save(args.output / "fallback.png")
+    for day, image in render_range(args.start, args.days, args.style):
+        image.save(args.output / f"{day.isoformat()}.png")
     last = args.start + timedelta(days=args.days - 1)
-    print(f"wrote {args.days} pages ({args.start} .. {last}) and fallback.png to {args.output}")
+    print(f"wrote {args.days} {args.style} pages ({args.start} .. {last}) and fallback.png "
+          f"to {args.output}")
 
 
 if __name__ == "__main__":
