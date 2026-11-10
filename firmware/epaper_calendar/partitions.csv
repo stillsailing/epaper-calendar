@@ -1,0 +1,8 @@
+# 4 MB flash. app0 matches lolin32's upload.maximum_size (1,310,720), so the
+# Arduino size check still guards it. "calendar" holds scripts/pack_calendar.py
+# output and is written separately by scripts/flash_data.sh.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x5000
+otadata,   data, ota,     0xe000,   0x2000
+app0,      app,  ota_0,   0x10000,  0x140000
+calendar,  data, 0x40,    0x150000, 0x2B0000
