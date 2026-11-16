@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Set the calendar's clock to this Mac's local time over USB serial.
+"""Set the calendar's clock to China Standard Time over USB serial.
+
+The pages follow the Chinese calendar, so the time sent is Asia/Shanghai
+regardless of this Mac's TZ setting (override with --tz).
 
 Without a DS3231 the firmware stays awake and accepts the time at any moment,
-so this first sends "SET YYYY-MM-DD HH:MM:SS" without resetting (a reset would
-erase the internal clock). If nothing answers, the board is in deep sleep
-(DS3231 mode): it is reset and the time is sent in the boot-time window. If the
-board has no auto-reset circuit, press its reset (EN/RST) button when asked.
+so this first sends "SET YYYY-MM-DD HH:MM:SS" without resetting. On boards
+whose USB-serial chip resets the ESP32 when the port opens (the tested ESP32-L
+does), that first attempt lands during boot and goes unanswered; the board is
+then reset and the time is sent in the boot-time window, as for a board in
+deep sleep (DS3231 mode). If the board has no auto-reset circuit, press its
+reset (EN/RST) button when asked.
 
-The firmware replies with how far the clock had drifted since the last SET.
+After the firmware confirms, this keeps the port open and echoes the log until
+the display refresh finishes: reopening the port later can reset the board,
+which erases the internal clock.
 """
 
 import argparse
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 try:
     import serial
@@ -22,10 +30,13 @@ except ImportError:
 
 PROMPT = b"to set the clock"
 PROMPT_TIMEOUT_S = 20
+REFRESH_DONE = "Powering off display driver"
+REFRESH_START_S = 3
+REFRESH_TIMEOUT_S = 90
 
 
-def send_time(port):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def send_time(port, zone):
+    now = datetime.now(zone).strftime("%Y-%m-%d %H:%M:%S")
     port.write(f"SET {now}\n".encode())
     print(f"sent SET {now}")
 
@@ -69,10 +80,31 @@ def reset_and_wait_for_prompt(port):
         buffer = (buffer + line)[-256:]
 
 
+def follow_refresh(port):
+    """Echo the log until the page refresh finishes, without reopening the port.
+
+    If the date did not change, no refresh starts and this returns after a few
+    seconds.
+    """
+    start = time.monotonic()
+    started = False
+    while time.monotonic() - start < (REFRESH_TIMEOUT_S if started else REFRESH_START_S):
+        line = port.readline().decode(errors="replace")
+        if line:
+            sys.stdout.write(line)
+        started = started or "Showing page" in line
+        if REFRESH_DONE in line or "Nothing to show" in line or "skipped" in line:
+            return
+    if started:
+        print("note: the refresh did not finish within the wait; check the panel")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("port", help="serial port, e.g. /dev/cu.usbserial-0001")
+    parser.add_argument("--tz", default="Asia/Shanghai", help="time zone to send (default: %(default)s)")
     args = parser.parse_args(argv)
+    zone = ZoneInfo(args.tz)
 
     with serial.Serial() as port:
         port.port = args.port
@@ -84,15 +116,14 @@ def main(argv=None):
         port.reset_input_buffer()
 
         # Awake (internal-clock mode): answers immediately, no reset.
-        send_time(port)
-        if await_reply(port, 2):
-            return
-
-        print("no answer; resetting the board (DS3231 mode sleeps between refreshes)")
-        reset_and_wait_for_prompt(port)
-        send_time(port)
-        if not await_reply(port, 5):
-            sys.exit("error: no confirmation from the firmware")
+        send_time(port, zone)
+        if not await_reply(port, 2):
+            print("no answer; resetting the board (it may be booting or in deep sleep)")
+            reset_and_wait_for_prompt(port)
+            send_time(port, zone)
+            if not await_reply(port, 5):
+                sys.exit("error: no confirmation from the firmware")
+        follow_refresh(port)
 
 
 if __name__ == "__main__":
