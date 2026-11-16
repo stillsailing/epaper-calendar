@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>墨水屏日历模拟器</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Local preview of the calendar firmware: shows the generated pages from
+   .build/pages/ (python3 scripts/generate_pages.py) and mirrors the button
+   logic of firmware/epaper_calendar/epaper_calendar.ino. Open this file
+   directly in a browser. Layout: the device on a desk, controls and the
+   serial log beside it (stacked on phones). */
+:root {
+  --bg: #e9e7e2;
+  --surface: #f6f5f2;
+  --fg: #1d1e20;
+  --muted: #62656a;
+  --line: #d4d1ca;
+  --accent: #2c5aa8;
+  --bezel: #232528;
+  --bezel-edge: #3a3d42;
+  --key: #2e3135;
+  --key-label: #c9ccd1;
+  --log-bg: #1c1e21;
+  --log-fg: #d8dcd2;
+  --log-dim: #8a9087;
+  --panel-red: #ff0000;
+  --font-body: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17181a; --surface: #202225; --fg: #e6e6e3; --muted: #9b9ea3; --line: #303338;
+    --accent: #86a8e4; --bezel: #0e0f10; --bezel-edge: #2b2e33; --key: #26292d;
+    --key-label: #b4b8be; --log-bg: #0f1012; --log-fg: #d8dcd2; --log-dim: #7a8078;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #17181a; --surface: #202225; --fg: #e6e6e3; --muted: #9b9ea3; --line: #303338;
+  --accent: #86a8e4; --bezel: #0e0f10; --bezel-edge: #2b2e33; --key: #26292d;
+  --key-label: #b4b8be; --log-bg: #0f1012; --log-fg: #d8dcd2; --log-dim: #7a8078;
+  color-scheme: dark;
+}
+[hidden] { display: none !important; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.55 var(--font-body);
+}
+.app {
+  max-width: 1280px; margin: 0 auto; padding-inline: 16px; padding-block: 24px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 24px; align-items: start;
+}
+h1 { margin: 0 0 4px; font-size: 22px; font-weight: 700; text-wrap: balance; }
+.sub { margin: 0 0 18px; color: var(--muted); }
+.stage { min-width: 0; }
+
+/* Device: bezel with the seven-key strip on its top edge. */
+.device {
+  position: relative; width: 100%; max-width: 900px;
+  background: var(--bezel); border: 1px solid var(--bezel-edge); border-radius: 10px;
+  padding: 7% 5.6% 6.6%;
+  box-shadow: 0 18px 40px -18px rgb(0 0 0 / 0.45);
+}
+.keys {
+  position: absolute; top: -1px; left: 50%; transform: translate(-50%, -100%);
+  width: 77%; display: grid; grid-template-columns: repeat(7, 1fr); gap: 1.2%;
+  padding: 6px 10px 0; background: var(--bezel); border: 1px solid var(--bezel-edge);
+  border-bottom: 0; border-radius: 8px 8px 0 0;
+}
+.key {
+  display: grid; justify-items: center; gap: 2px; padding: 4px 0 6px;
+  background: none; border: 0; color: var(--key-label); cursor: pointer;
+  font: 500 12px/1.2 var(--font-body); border-radius: 6px;
+}
+.key i {
+  display: block; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--key); border: 1px solid var(--bezel-edge);
+  box-shadow: inset 0 -2px 0 rgb(0 0 0 / 0.35);
+}
+.key:hover i { border-color: var(--key-label); }
+.key:active i, .key.pressed i { transform: translateY(1px); box-shadow: none; }
+.key:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.key kbd { font: 11px/1 var(--font-mono); color: var(--log-dim); }
+.screen { position: relative; aspect-ratio: 800 / 480; max-width: 100%; background: #fff; }
+.screen svg { display: block; width: 100%; height: 100%; }
+.screen.paper svg { filter: saturate(0.72) contrast(0.92) brightness(0.98) sepia(0.06); }
+.flash { position: absolute; inset: 0; pointer-events: none; opacity: 0; }
+.empty {
+  position: absolute; inset: 0; display: grid; place-content: center; gap: 6px;
+  padding: 16px; text-align: center; color: #555; background: #f2f1ed;
+}
+.empty code { font: 13px var(--font-mono); }
+.status {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.status b { color: var(--fg); font-weight: 500; }
+.chip {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--line); color: var(--fg);
+}
+.chip.busy { border-color: var(--accent); color: var(--accent); }
+
+.side { min-width: 0; display: grid; gap: 18px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+h2 { margin: 0 0 10px; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; color: var(--muted); }
+.field { display: grid; gap: 6px; margin-bottom: 12px; }
+.field:last-child { margin-bottom: 0; }
+.field label { font-weight: 500; }
+input[type=date] {
+  font: 14px var(--font-body); color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+}
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+button.text {
+  font: 500 13px var(--font-body); color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer;
+}
+button.text:hover { border-color: var(--accent); }
+.check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.check input { margin: 0; accent-color: var(--accent); }
+.hint { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.log {
+  margin: 0; height: 260px; overflow: auto; padding: 10px 12px; border-radius: 8px;
+  background: var(--log-bg); color: var(--log-fg); font: 12px/1.6 var(--font-mono);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.log div { padding-left: 2ch; text-indent: -2ch; }
+.log .t { color: var(--log-dim); }
+@media (max-width: 900px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .key { font-size: 10px; }
+  .key kbd { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="app">
+  <main class="stage">
+    <h1>墨水屏日历模拟器</h1>
+    <p class="sub">显示 <code>.build/pages/</code> 里生成好的页面，按键逻辑与固件一致。</p>
+    <div style="padding-top: 56px">
+      <div class="device">
+        <div class="keys" id="keys" role="toolbar" aria-label="按键（从左到右，与外壳一致）"></div>
+        <div class="screen" id="screen">
+          <svg id="panel" viewBox="0 0 800 480" role="img" aria-label="墨水屏">
+            <defs>
+              <!-- Today's block: background (white/yellow) -> red, text -> white. -->
+              <filter id="today-fill" color-interpolation-filters="sRGB" x="0" y="0" width="1" height="1">
+                <feColorMatrix type="matrix" values="0 0 0 0 1  0 -1 0 0 1  0 -1 0 0 1  0 0 0 1 0"/>
+              </filter>
+              <!-- Cut-off corners: festival yellow -> white. -->
+              <filter id="today-corner" color-interpolation-filters="sRGB" x="0" y="0" width="1" height="1">
+                <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 1 0 0 0  0 0 0 1 0"/>
+              </filter>
+              <clipPath id="today-block"><rect id="today-rect" rx="6" ry="6"/></clipPath>
+              <clipPath id="today-corners"><path id="today-corners-path" clip-rule="evenodd"/></clipPath>
+            </defs>
+            <rect width="800" height="480" fill="#fff"/>
+            <image id="page" width="800" height="480"/>
+            <g id="today" style="display: none">
+              <image class="page-copy" width="800" height="480" clip-path="url(#today-corners)" filter="url(#today-corner)"/>
+              <image class="page-copy" width="800" height="480" clip-path="url(#today-block)" filter="url(#today-fill)"/>
+            </g>
+          </svg>
+          <div class="flash" id="flash"></div>
+          <div class="empty" id="empty" hidden>
+            <strong>找不到页面图片</strong>
+            <span>先在项目目录运行：</span>
+            <code>python3 scripts/generate_pages.py</code>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="status" aria-live="polite">
+      <span>显示：<b id="st-key">—</b></span>
+      <span>视图：<b id="st-view">—</b></span>
+      <span id="st-browse"></span>
+      <span class="chip" id="st-busy">空闲</span>
+    </div>
+  </main>
+
+  <aside class="side">
+    <section class="card">
+      <h2>模拟环境</h2>
+      <div class="field">
+        <label for="today">今天是</label>
+        <div class="row">
+          <input type="date" id="today">
+          <button type="button" class="text" id="real-today">回到真实日期</button>
+        </div>
+        <p class="hint">改日期相当于给设备重新校时。</p>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="unset">时钟未设置（显示等待校时页）</label>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="paper" checked>墨水屏观感（颜色偏淡）</label>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="slow">按真实速度刷新（约 25 秒）</label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>串口日志</h2>
+      <pre class="log" id="log" aria-live="polite"></pre>
+      <div class="row" style="margin-top: 8px">
+        <button type="button" class="text" id="clear-log">清空</button>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<script>
+// ---- Mirrors firmware/epaper_calendar/epaper_calendar.ino ------------------
+const PAGES = "../.build/pages/";
+const SETTLE_MS = 1500;          // kSettleMs
+const BROWSE_MS = 120000;        // kBrowseSeconds
+const GRID = { left: 40, right: 760, top: 116, bottom: 436 };  // kMonthGrid*
+const RADIUS = 6;                // kTodayRadius
+const KEYS = [                   // Left to right on the enclosure.
+  { action: "wake", label: "激活", gpio: 32, kbd: "W" },
+  { action: "prevMonth", label: "上一月", gpio: 33, kbd: "↑" },
+  { action: "prevDay", label: "上一天", gpio: 25, kbd: "←" },
+  { action: "today", label: "今天", gpio: 26, kbd: "T" },
+  { action: "nextDay", label: "下一天", gpio: 4, kbd: "→" },
+  { action: "nextMonth", label: "下一月", gpio: 16, kbd: "↓" },
+  { action: "monthView", label: "月历", gpio: 17, kbd: "M" },
+];
+const KEYMAP = { w: "wake", ArrowUp: "prevMonth", ArrowLeft: "prevDay", t: "today",
+  ArrowRight: "nextDay", ArrowDown: "nextMonth", m: "monthView" };
+
+// Dates are UTC midnights, so day arithmetic never meets a DST change.
+const DAY = 86400000;
+const utc = (y, m, d) => new Date(Date.UTC(y, m - 1, d));
+const parts = (d) => [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()];
+const pad = (n) => String(n).padStart(2, "0");
+const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
+function addMonths(d, months) {  // addMonths() in rtc_ds3231.cpp: day clamped
+  const [y, m, day] = parts(d);
+  const index = y * 12 + (m - 1) + months;
+  const ny = Math.floor(index / 12), nm = index % 12 + 1;
+  return utc(ny, nm, Math.min(day, daysInMonth(ny, nm)));
+}
+const dayKey = (d) => { const [y, m, day] = parts(d); return y * 10000 + m * 100 + day; };
+const monthKey = (k) => Math.floor(k / 100) * 100;
+function fileFor(k) {
+  if (k === 0) return "fallback.png";
+  const y = Math.floor(k / 10000), m = Math.floor(k / 100) % 100, d = k % 100;
+  return d ? `${y}-${pad(m)}-${pad(d)}.png` : `${y}-${pad(m)}.png`;
+}
+
+const state = {
+  today: null, clockOk: true, offset: 0, monthView: false, browseUntil: 0,
+  shown: null, quietUntil: 0, force: false, busy: false,
+};
+
+// ---- Page store: an <img> per file; a failed load means "no page" ----------
+const images = new Map();
+function loadPage(k) {
+  const file = fileFor(k);
+  if (!images.has(file)) {
+    images.set(file, new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => resolve(null);
+      img.src = PAGES + file;
+    }));
+  }
+  return images.get(file);
+}
+
+// ---- Serial log ---------------------------------------------------------------
+const logEl = document.getElementById("log");
+function log(text) {
+  const t = new Date().toTimeString().slice(0, 8);
+  const line = document.createElement("div");
+  line.innerHTML = `<span class="t">${t}</span> `;
+  line.append(text);
+  logEl.append(line);
+  while (logEl.childElementCount > 200) logEl.firstChild.remove();
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---- Firmware logic -------------------------------------------------------------
+const browsing = () => state.offset !== 0 || state.monthView;
+const viewDate = () => new Date(state.today.getTime() + state.offset * DAY);
+function wantedKey() {
+  if (!state.clockOk) return 0;
+  if (browsing() && Date.now() >= state.browseUntil) {
+    log("Browsing timed out; back to today");
+    state.offset = 0;
+    state.monthView = false;
+  }
+  const date = dayKey(viewDate());
+  return state.monthView ? monthKey(date) : date;
+}
+function monthStep(months) {
+  return Math.round((addMonths(viewDate(), months) - state.today) / DAY);
+}
+
+async function onButton(action) {
+  if (action === "wake") { log("Wake key: buttons active"); return; }
+  if (action === "today") {
+    log("Today key: redrawing today");
+    state.offset = 0; state.monthView = false; state.force = true;
+    return;
+  }
+  if (!state.clockOk) { log("Clock not set; browsing disabled"); return; }
+  let offset = state.offset, monthView = state.monthView;
+  if (action === "prevDay" || action === "nextDay") {
+    offset += monthView ? 0 : (action === "prevDay" ? -1 : 1);
+    monthView = false;
+  }
+  if (action === "prevMonth") offset = monthStep(-1);
+  if (action === "nextMonth") offset = monthStep(1);
+  if (action === "monthView") monthView = !monthView;
+  const date = dayKey(new Date(state.today.getTime() + offset * DAY));
+  const key = monthView ? monthKey(date) : date;
+  if (!(await loadPage(key))) { log(`No page for ${key}`); return; }
+  state.offset = offset;
+  state.monthView = monthView;
+  state.browseUntil = Date.now() + BROWSE_MS;
+  state.quietUntil = Date.now() + SETTLE_MS;
+  log(`Viewing ${key} (${offset >= 0 ? "+" : ""}${offset} days)`);
+}
+
+// markToday(): today's block on the month view of the current month.
+function todayFrame(key) {
+  if (key % 100 !== 0 || key !== monthKey(dayKey(state.today))) return null;
+  const [y, m, d] = parts(state.today);
+  const firstDay = Math.floor(utc(y, m, 1) / DAY);
+  const firstCol = (firstDay + 3) % 7;  // 1970-01-01 was a Thursday.
+  const index = firstCol + d - 1;
+  const rows = Math.floor((firstCol + daysInMonth(y, m) + 6) / 7);
+  const cellW = (GRID.right - GRID.left) / 7, rowH = (GRID.bottom - GRID.top) / rows;
+  const col = index % 7, row = Math.floor(index / 7);
+  return [Math.trunc(GRID.left + col * cellW) + 3, Math.trunc(GRID.top + row * rowH) + 2,
+          Math.trunc(GRID.left + (col + 1) * cellW) - 3, Math.trunc(GRID.top + (row + 1) * rowH) - 2];
+}
+
+const flash = document.getElementById("flash");
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A full color refresh: the panel flashes between inks before settling.
+async function refreshEffect() {
+  const slow = document.getElementById("slow").checked;
+  if (reduceMotion.matches && !slow) return;
+  const steps = ["#000", "#fff", "#ff0", "#f00", "#000", "#fff"];
+  const each = slow ? 4000 : 90;
+  flash.style.opacity = "1";
+  for (const color of steps) { flash.style.background = color; await sleep(each); }
+  flash.style.opacity = "0";
+}
+
+async function showPage(key) {
+  let img = await loadPage(key);
+  if (!img && key !== 0) {
+    log(`Page ${key}: not found; trying fallback page`);
+    key = 0;
+    img = await loadPage(0);
+  }
+  if (!img) {
+    log("Nothing to show: no pages; run scripts/generate_pages.py");
+    document.getElementById("empty").hidden = false;
+    return;
+  }
+  document.getElementById("empty").hidden = true;
+  const frame = todayFrame(key);
+  log(`Showing page ${key}${frame ? ", today marked" : ""}`);
+  log("Waiting for refresh");
+  await refreshEffect();
+  for (const el of document.querySelectorAll("#page, .page-copy")) el.setAttribute("href", img.src);
+  const today = document.getElementById("today");
+  today.style.display = frame ? "" : "none";  // SVG elements have no .hidden
+  if (frame) {
+    const [x0, y0, x1, y1] = frame;
+    const w = x1 - x0 + 1, h = y1 - y0 + 1, r = RADIUS;
+    const rect = document.getElementById("today-rect");
+    for (const [k, v] of Object.entries({ x: x0, y: y0, width: w, height: h })) rect.setAttribute(k, v);
+    // The cell minus the rounded block: only the four corners.
+    document.getElementById("today-corners-path").setAttribute("d",
+      `M${x0} ${y0}h${w}v${h}h${-w}Z ` +
+      `M${x0 + r} ${y0}h${w - 2 * r}a${r} ${r} 0 0 1 ${r} ${r}v${h - 2 * r}a${r} ${r} 0 0 1 ${-r} ${r}` +
+      `h${-(w - 2 * r)}a${r} ${r} 0 0 1 ${-r} ${-r}v${-(h - 2 * r)}a${r} ${r} 0 0 1 ${r} ${-r}Z`);
+  }
+  log("Powering off display driver");
+}
+
+// service(): one pass of the awake loop.
+async function service() {
+  if (state.busy) return;
+  if (Date.now() < state.quietUntil) return;
+  const wanted = wantedKey();
+  if (wanted === state.shown && !state.force) return;
+  state.busy = true; state.force = false;
+  renderStatus();
+  await showPage(wanted);
+  state.shown = wanted;
+  state.busy = false;
+  renderStatus();
+}
+
+// ---- UI ---------------------------------------------------------------------------
+function renderStatus() {
+  const k = state.shown;
+  document.getElementById("st-key").textContent = k === null ? "—" : fileFor(k);
+  document.getElementById("st-view").textContent =
+    !state.clockOk ? "等待校时" : state.monthView ? "月历" : state.offset ? "单日（翻看中）" : "单日（今天）";
+  const left = Math.max(0, Math.ceil((state.browseUntil - Date.now()) / 1000));
+  document.getElementById("st-browse").textContent =
+    browsing() && state.clockOk ? `${left} 秒后回到今天` : "";
+  const busy = document.getElementById("st-busy");
+  busy.textContent = state.busy ? "刷新中，按键无效" : "空闲";
+  busy.classList.toggle("busy", state.busy);
+}
+
+const keysEl = document.getElementById("keys");
+for (const k of KEYS) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "key";
+  b.dataset.action = k.action;
+  b.title = `${k.label} · GPIO${k.gpio} · 键盘 ${k.kbd}`;
+  b.innerHTML = `<i></i><span>${k.label}</span><kbd>${k.kbd}</kbd>`;
+  b.addEventListener("click", () => press(k.action));
+  keysEl.append(b);
+}
+async function press(action) {
+  const b = keysEl.querySelector(`[data-action="${action}"]`);
+  b.classList.add("pressed");
+  setTimeout(() => b.classList.remove("pressed"), 120);
+  if (state.busy) return;  // The firmware does not poll keys during a refresh.
+  await onButton(action);
+  renderStatus();
+}
+document.addEventListener("keydown", (e) => {
+  if (e.target.closest("input, textarea") || e.metaKey || e.ctrlKey || e.altKey) return;
+  const action = KEYMAP[e.key] ?? KEYMAP[e.key.toLowerCase()];
+  if (!action) return;
+  e.preventDefault();
+  press(action);
+});
+
+const todayInput = document.getElementById("today");
+function realToday() { const n = new Date(); return utc(n.getFullYear(), n.getMonth() + 1, n.getDate()); }
+function setClock(date) {
+  state.today = date;
+  todayInput.value = date.toISOString().slice(0, 10);
+  const [y, m, d] = parts(date);
+  log(`Clock set to ${y}-${pad(m)}-${pad(d)} (simulated)`);
+}
+todayInput.addEventListener("change", () => {
+  if (!todayInput.value) return;
+  const [y, m, d] = todayInput.value.split("-").map(Number);
+  setClock(utc(y, m, d));
+});
+document.getElementById("real-today").addEventListener("click", () => setClock(realToday()));
+document.getElementById("unset").addEventListener("change", (e) => {
+  state.clockOk = !e.target.checked;
+  log(state.clockOk ? "Clock set (simulated)" : "Internal clock not set; run scripts/set_rtc.py");
+});
+document.getElementById("paper").addEventListener("change", (e) => {
+  document.getElementById("screen").classList.toggle("paper", e.target.checked);
+});
+document.getElementById("screen").classList.toggle("paper", document.getElementById("paper").checked);
+document.getElementById("clear-log").addEventListener("click", () => { logEl.textContent = ""; });
+
+log("Boot (simulated); internal clock mode");
+setClock(realToday());
+setInterval(() => { service(); renderStatus(); }, 200);
+</script>
+</html>

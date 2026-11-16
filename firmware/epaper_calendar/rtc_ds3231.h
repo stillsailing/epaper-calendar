@@ -25,5 +25,7 @@ uint32_t dateKey(const LocalTime &time);                  // YYYYMMDD
 uint32_t secondsUntilNextDay(const LocalTime &time, uint32_t offsetSeconds);
 int64_t toEpochSeconds(const LocalTime &time);  // Seconds since 1970-01-01 00:00 local.
 LocalTime fromEpochSeconds(int64_t seconds);
+// Same day and time `months` later (or earlier), the day clamped to the month's length.
+LocalTime addMonths(const LocalTime &time, int months);
 
 #endif

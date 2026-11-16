@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <driver/rtc_io.h>
 #include <esp_partition.h>
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
@@ -33,6 +34,39 @@ constexpr uint8_t kMosiPin = 23;
 constexpr uint8_t kRtcSdaPin = 21;
 constexpr uint8_t kRtcSclPin = 22;
 
+// Buttons, active low: a key connects its pin to GND (internal pull-ups are on;
+// a module's own pull-ups also work). Power a button module from 3.3 V, never
+// 5 V. All pins have internal pull-ups and none is a strapping pin. Only the
+// wake key can wake the chip from deep sleep (ext0, so it must be an RTC GPIO);
+// the others work while it is awake.
+constexpr uint8_t kWakePin = 32;
+constexpr uint8_t kPrevMonthPin = 33;
+constexpr uint8_t kPrevDayPin = 25;
+constexpr uint8_t kTodayPin = 26;
+constexpr uint8_t kNextDayPin = 4;
+constexpr uint8_t kNextMonthPin = 16;
+constexpr uint8_t kMonthViewPin = 17;
+// Declared up here, before the prototypes the Arduino preprocessor inserts.
+enum class Action : uint8_t { Wake, PrevMonth, PrevDay, Today, NextDay, NextMonth, MonthView };
+constexpr uint32_t kDebounceMs = 30;
+constexpr uint32_t kSettleMs = 1500;        // Wait for further presses before drawing.
+constexpr int64_t kBrowseSeconds = 120;     // Then return to today.
+constexpr uint32_t kSessionIdleMs = 30000;  // DS3231 mode: stay awake after the wake key.
+
+// Month view: pages are drawn on the Mac; the firmware turns today's cell into
+// a red rounded block with white text while streaming the page out. The grid area mirrors MONTH_GRID_*
+// in scripts/generate_pages.py (scripts/test_pack_calendar.py checks them).
+constexpr int kPanelWidth = 800;
+constexpr int kMonthGridLeft = 40;
+constexpr int kMonthGridRight = 760;
+constexpr int kMonthGridTop = 116;
+constexpr int kMonthGridBottom = 436;
+constexpr int kTodayRadius = 6;  // Corner radius of today's block, pixels.
+// Panel codes, as in the vendor Color_get().
+constexpr uint8_t kWhiteNibble = 0x1;
+constexpr uint8_t kYellowNibble = 0x2;
+constexpr uint8_t kRedNibble = 0x3;
+
 // Two clock modes, chosen at boot by whether the DS3231 answers:
 //  - DS3231: refresh, then deep sleep until shortly after local midnight. The
 //    ESP32 sleep timer runs from an internal RC oscillator that can drift by a
@@ -54,6 +88,11 @@ constexpr uint32_t kTimeSetWindowMs = 5000;
 constexpr uint32_t kNothingShown = UINT32_MAX;
 constexpr uint32_t kShownFallback = 1;  // Not a valid YYYYMMDD.
 RTC_DATA_ATTR uint32_t gShownKey = kNothingShown;
+// Browsing with the buttons: days from today, whether the month view (page
+// key YYYYMM00) is shown, and when to return to today (local epoch seconds).
+RTC_DATA_ATTR int32_t gViewOffset = 0;
+RTC_DATA_ATTR bool gMonthView = false;
+RTC_DATA_ATTR int64_t gBrowseUntil = 0;
 
 const esp_partition_t *gPartition = nullptr;
 
@@ -61,31 +100,54 @@ bool readPartition(uint32_t offset, void *dst, size_t len) {
   return esp_partition_read(gPartition, offset, dst, len) == ESP_OK;
 }
 
-void sendToPanel(const uint8_t *data, size_t len) {
-  for (size_t i = 0; i < len; i++) EPD_W21_WriteDATA(data[i]);
+bool findPartition() {
+  if (!gPartition) {
+    gPartition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, static_cast<esp_partition_subtype_t>(0x40), "calendar");
+  }
+  return gPartition != nullptr;
 }
 
-// Finds the page for `date` (falling back to the fallback page), verifies it,
-// then performs one full refresh and powers off the display driver.
-bool showPage(uint32_t date) {
-  gPartition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
-                                        static_cast<esp_partition_subtype_t>(0x40), "calendar");
-  if (!gPartition) {
-    Serial.println("[calendar] No calendar partition; flash partitions.csv with the firmware");
-    return false;
-  }
+bool pageExists(uint32_t date) {
   PageRef page;
-  const char *error = storeFind(readPartition, gPartition->size, date, page);
-  if (error && date != kFallbackDate) {
-    Serial.printf("[calendar] Page %lu: %s; trying fallback page\n", (unsigned long)date, error);
-    error = storeFind(readPartition, gPartition->size, kFallbackDate, page);
-  }
-  if (!error) error = storeDecode(readPartition, page, nullptr);  // Verify before touching the panel.
-  if (error) {
-    Serial.printf("[calendar] Nothing to show: %s\n", error);
-    return false;
-  }
+  return findPartition() && !storeFind(readPartition, gPartition->size, date, page);
+}
 
+// Today's cell on the month view; recolored while the page streams out.
+struct Frame {
+  bool on;
+  int x0, y0, x1, y1;  // Inclusive; covers the generator's yellow festival box.
+};
+Frame gFrame = {false, 0, 0, 0, 0};
+uint32_t gSent = 0;  // Bytes of the current page sent so far.
+
+// Inside the rounded block: background (white or festival yellow) turns red and
+// text turns white. In the cut-off corners, festival yellow turns white.
+uint8_t framed(int x, int y, uint8_t nibble) {
+  if (x < gFrame.x0 || x > gFrame.x1 || y < gFrame.y0 || y > gFrame.y1) return nibble;
+  const int cx = x < gFrame.x0 + kTodayRadius ? gFrame.x0 + kTodayRadius
+               : x > gFrame.x1 - kTodayRadius ? gFrame.x1 - kTodayRadius : x;
+  const int cy = y < gFrame.y0 + kTodayRadius ? gFrame.y0 + kTodayRadius
+               : y > gFrame.y1 - kTodayRadius ? gFrame.y1 - kTodayRadius : y;
+  const bool background = nibble == kWhiteNibble || nibble == kYellowNibble;
+  if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > kTodayRadius * kTodayRadius) {
+    return nibble == kYellowNibble ? kWhiteNibble : nibble;
+  }
+  return background ? kRedNibble : kWhiteNibble;
+}
+
+void sendToPanel(const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len; i++, gSent++) {
+    uint8_t b = data[i];
+    if (gFrame.on) {  // Two pixels per byte, left one in the high nibble.
+      const int y = gSent / (kPanelWidth / 2), x = gSent % (kPanelWidth / 2) * 2;
+      b = framed(x, y, b >> 4) << 4 | framed(x + 1, y, b & 0x0F);
+    }
+    EPD_W21_WriteDATA(b);
+  }
+}
+
+bool panelBegin() {
   pinMode(kBusyPin, INPUT);
   pinMode(kResetPin, OUTPUT);
   pinMode(kDcPin, OUTPUT);
@@ -99,16 +161,12 @@ bool showPage(uint32_t date) {
     return false;
   }
   SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  return true;
+}
 
-  // Same sequence as the vendor PIC_display(), fed from flash instead of image.h.
-  Serial.printf("[calendar] Showing page %lu (%lu bytes compressed)\n",
-                (unsigned long)page.date, (unsigned long)page.length);
-  EPD_init();
-  EPD_W21_WriteCMD(0x10);
-  error = storeDecode(readPartition, page, sendToPanel);
-  if (error) {
-    Serial.printf("[calendar] Page changed while drawing (%s); refresh skipped\n", error);
-  } else {
+// Refreshes from the data already sent, then powers off the display driver.
+void panelRefreshAndOff(bool refresh) {
+  if (refresh) {
     Serial.println("[calendar] Waiting for refresh");
     EPD_W21_WriteCMD(0x12);  // Display refresh.
     EPD_W21_WriteDATA(0x00);
@@ -118,6 +176,40 @@ bool showPage(uint32_t date) {
   Serial.println("[calendar] Powering off display driver");
   EPD_sleep();
   SPI.endTransaction();
+}
+
+// Finds the page for `date` (falling back to the fallback page), verifies it,
+// then performs one full refresh and powers off the display driver.
+bool showPage(uint32_t date) {
+  if (!findPartition()) {
+    Serial.println("[calendar] No calendar partition; flash partitions.csv with the firmware");
+    return false;
+  }
+  PageRef page;
+  const char *error = storeFind(readPartition, gPartition->size, date, page);
+  if (error && date != kFallbackDate) {
+    Serial.printf("[calendar] Page %lu: %s; trying fallback page\n", (unsigned long)date, error);
+    error = storeFind(readPartition, gPartition->size, kFallbackDate, page);
+    gFrame.on = false;
+  }
+  if (!error) error = storeDecode(readPartition, page, nullptr);  // Verify before touching the panel.
+  if (error) {
+    Serial.printf("[calendar] Nothing to show: %s\n", error);
+    return false;
+  }
+
+  if (!panelBegin()) return false;
+
+  // Same sequence as the vendor PIC_display(), fed from flash instead of image.h.
+  Serial.printf("[calendar] Showing page %lu (%lu bytes compressed)%s\n",
+                (unsigned long)page.date, (unsigned long)page.length,
+                gFrame.on ? ", today marked" : "");
+  EPD_init();
+  EPD_W21_WriteCMD(0x10);
+  gSent = 0;
+  error = storeDecode(readPartition, page, sendToPanel);
+  if (error) Serial.printf("[calendar] Page changed while drawing (%s); refresh skipped\n", error);
+  panelRefreshAndOff(!error);
   return !error;
 }
 
@@ -201,15 +293,6 @@ void pollSerial() {
   }
 }
 
-// Shows today's page, or the fallback page when the clock is unset, unless it
-// is already on the panel.
-void updateDisplay(bool clockOk, const LocalTime &now) {
-  const uint32_t wanted = clockOk ? dateKey(now) : kShownFallback;
-  if (wanted == gShownKey) return;
-  showPage(clockOk ? wanted : kFallbackDate);
-  gShownKey = wanted;  // Recorded even on failure so a bad page is not retried.
-}
-
 void logClock(bool clockOk, const LocalTime &now) {
   if (clockOk) {
     Serial.printf("[calendar] Now %04u-%02u-%02u %02u:%02u:%02u\n", now.year, now.month, now.day,
@@ -221,18 +304,213 @@ void logClock(bool clockOk, const LocalTime &now) {
   }
 }
 
+uint32_t daysFrom(const LocalTime &now, int32_t days) {
+  return dateKey(fromEpochSeconds(toEpochSeconds(now) + days * 86400LL));
+}
+
+uint32_t monthKey(uint32_t date) { return date / 100 * 100; }
+
+bool browsing() { return gViewOffset != 0 || gMonthView; }
+
+// The page that belongs on the panel: today's (or the day or month being
+// browsed), or the fallback page when the clock is unset.
+uint32_t wantedKey(bool clockOk, const LocalTime &now) {
+  if (!clockOk) return kShownFallback;
+  if (browsing() && toEpochSeconds(now) >= gBrowseUntil) {
+    Serial.println("[calendar] Browsing timed out; back to today");
+    gViewOffset = 0;
+    gMonthView = false;
+  }
+  const uint32_t date = daysFrom(now, gViewOffset);
+  return gMonthView ? monthKey(date) : date;
+}
+
+// Marks today's cell when `key` is the month view of the current month, using
+// the same grid as render_month() in scripts/generate_pages.py.
+void markToday(uint32_t key, const LocalTime &now) {
+  gFrame.on = false;
+  if (key % 100 != 0 || key != monthKey(dateKey(now))) return;
+  const LocalTime first = {now.year, now.month, 1, 0, 0, 0};
+  const int64_t firstDay = toEpochSeconds(first) / 86400;
+  const int days = static_cast<int>(toEpochSeconds(addMonths(first, 1)) / 86400 - firstDay);
+  const int firstCol = static_cast<int>((firstDay + 3) % 7);  // 1970-01-01 was a Thursday.
+  const int index = firstCol + now.day - 1;
+  const int rows = (firstCol + days + 6) / 7;
+  const float cellW = (kMonthGridRight - kMonthGridLeft) / 7.0f;
+  const float rowH = static_cast<float>(kMonthGridBottom - kMonthGridTop) / rows;
+  const int col = index % 7, row = index / 7;
+  gFrame = {true, static_cast<int>(kMonthGridLeft + col * cellW) + 3,
+            static_cast<int>(kMonthGridTop + row * rowH) + 2,
+            static_cast<int>(kMonthGridLeft + (col + 1) * cellW) - 3,
+            static_cast<int>(kMonthGridTop + (row + 1) * rowH) - 2};
+}
+
+// Shows the wanted page unless it is already on the panel (or `force`).
+void updateDisplay(bool clockOk, const LocalTime &now, bool force = false) {
+  const uint32_t wanted = wantedKey(clockOk, now);
+  if (wanted == gShownKey && !force) return;
+  if (clockOk) markToday(wanted, now);
+  else gFrame.on = false;
+  showPage(clockOk ? wanted : kFallbackDate);
+  gShownKey = wanted;  // Recorded even on failure so a bad page is not retried.
+}
+
+// A member function, so the Arduino preprocessor does not hoist a prototype
+// above the struct.
+struct Button {
+  uint8_t pin;
+  Action action;
+  bool down;  // Debounced state.
+  bool raw;
+  uint32_t changedAt;
+
+  // True once per debounced press.
+  bool pressed() {
+    const bool now = digitalRead(pin) == LOW;
+    if (now != raw) {
+      raw = now;
+      changedAt = millis();
+      return false;
+    }
+    if (now == down || millis() - changedAt < kDebounceMs) return false;
+    down = now;
+    return now;
+  }
+};
+// Left to right on the enclosure, seen from the front.
+Button gButtons[] = {
+    {kWakePin, Action::Wake},       {kPrevMonthPin, Action::PrevMonth},
+    {kPrevDayPin, Action::PrevDay}, {kTodayPin, Action::Today},
+    {kNextDayPin, Action::NextDay}, {kNextMonthPin, Action::NextMonth},
+    {kMonthViewPin, Action::MonthView}};
+
+bool gForceRefresh = false;
+uint32_t gQuietUntil = 0;  // millis(); drawing waits while presses keep coming.
+
+void beginButtons() {
+  rtc_gpio_deinit(static_cast<gpio_num_t>(kWakePin));  // Back from deep-sleep wake config.
+  for (Button &b : gButtons) {
+    pinMode(b.pin, INPUT_PULLUP);
+    b.down = b.raw = digitalRead(b.pin) == LOW;  // A key already held is not a new press.
+    b.changedAt = millis();
+  }
+}
+
+// Days from today to the same day `months` away from the viewed date, with the
+// day clamped to the month's length (31 March - 1 month = 28/29 February).
+int32_t monthStep(const LocalTime &now, int months) {
+  const int64_t today = toEpochSeconds(now);
+  const LocalTime target = addMonths(fromEpochSeconds(today + gViewOffset * 86400LL), months);
+  return static_cast<int32_t>((toEpochSeconds(target) - today) / 86400);
+}
+
+void onButton(Action action, bool clockOk, const LocalTime &now) {
+  switch (action) {
+    case Action::Wake:
+      Serial.println("[calendar] Wake key: buttons active");
+      return;
+    case Action::Today:
+      Serial.println("[calendar] Today key: redrawing today");
+      gViewOffset = 0;
+      gMonthView = false;
+      gForceRefresh = true;
+      return;
+    default:
+      break;
+  }
+  if (!clockOk) {
+    Serial.println("[calendar] Clock not set; browsing disabled");
+    return;
+  }
+  // Month keys keep the current view; day keys leave the month view; the month
+  // view key toggles it.
+  int32_t offset = gViewOffset;
+  bool monthView = gMonthView;
+  if (action == Action::PrevDay || action == Action::NextDay) {
+    offset += monthView ? 0 : (action == Action::PrevDay ? -1 : 1);
+    monthView = false;
+  }
+  if (action == Action::PrevMonth) offset = monthStep(now, -1);
+  if (action == Action::NextMonth) offset = monthStep(now, 1);
+  if (action == Action::MonthView) monthView = !monthView;
+  const uint32_t date = daysFrom(now, offset);
+  const uint32_t key = monthView ? monthKey(date) : date;
+  if (!pageExists(key)) {
+    Serial.printf("[calendar] No page for %lu\n", (unsigned long)key);
+    return;
+  }
+  gViewOffset = offset;
+  gMonthView = monthView;
+  gBrowseUntil = toEpochSeconds(now) + kBrowseSeconds;
+  gQuietUntil = millis() + kSettleMs;
+  Serial.printf("[calendar] Viewing %lu (%+ld days)\n", (unsigned long)key, (long)offset);
+}
+
+// One pass of the awake loop: serial, buttons, and any refresh that is due.
+// Returns true if a button was pressed or the panel was redrawn.
+bool service() {
+  esp_task_wdt_reset();
+  pollSerial();
+  LocalTime now;
+  const bool clockOk = readClock(now);
+  bool active = false;
+  for (Button &b : gButtons) {
+    if (b.pressed()) {
+      onButton(b.action, clockOk, now);
+      active = true;
+    }
+  }
+  if (static_cast<int32_t>(millis() - gQuietUntil) < 0) return active;
+  if (gForceRefresh || wantedKey(clockOk, now) != gShownKey) {
+    logClock(clockOk, now);
+    updateDisplay(clockOk, now, gForceRefresh);
+    gForceRefresh = false;
+    active = true;
+  }
+  return active;
+}
+
+// Lets the wake key wake the chip. A key held down (or stuck) would wake it
+// again immediately, so it is left out until the next sleep.
+void enableButtonWake() {
+  const gpio_num_t pin = static_cast<gpio_num_t>(kWakePin);
+  if (digitalRead(kWakePin) == LOW) {
+    Serial.println("[calendar] Wake key held; not a wake source this time");
+    return;
+  }
+  esp_sleep_enable_ext0_wakeup(pin, 0);
+  rtc_gpio_pullup_en(pin);
+  rtc_gpio_pulldown_dis(pin);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);  // Keeps the pull-up on.
+}
+
 // Does not return: deep sleep ends in a reset.
 void sleepFor(uint32_t seconds) {
   Serial.printf("[calendar] Deep sleep for %lu s\n", (unsigned long)seconds);
   Serial.flush();
   esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
+  enableButtonWake();
   esp_deep_sleep_start();
+}
+
+// Until shortly after midnight (cut short against RC drift), or until browsing
+// times out.
+uint32_t sleepSeconds(const LocalTime &now) {
+  const uint32_t remaining = secondsUntilNextDay(now, kRefreshOffsetSeconds);
+  uint32_t seconds = remaining > kShortSleepSeconds ? remaining / 10 * 9 : remaining;
+  if (browsing()) {
+    const int64_t browse = gBrowseUntil - toEpochSeconds(now);
+    seconds = browse < 1 ? 1 : (browse < seconds ? static_cast<uint32_t>(browse) : seconds);
+  }
+  return seconds;
 }
 
 void setup() {
   Serial.begin(115200);
   const esp_reset_reason_t reason = esp_reset_reason();
   const bool coldStart = reason != ESP_RST_DEEPSLEEP;
+  const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+  const bool buttonWake = wake == ESP_SLEEP_WAKEUP_EXT0;
   if (coldStart) delay(1000);  // Give a USB serial monitor time to attach.
   Serial.println();
   Serial.printf("[calendar] Boot, reset reason %d\n", static_cast<int>(reason));
@@ -248,6 +526,7 @@ void setup() {
                        reason == ESP_RST_WDT || reason == ESP_RST_PANIC ||
                        reason == ESP_RST_BROWNOUT;
 
+  beginButtons();
   rtcBegin(kRtcSdaPin, kRtcSclPin);
   LocalTime now;
   if (rtcRead(now) == RtcStatus::NotFound) {
@@ -261,33 +540,30 @@ void setup() {
   logClock(clockOk, now);
   if (faulted) {
     Serial.println("[calendar] Previous run faulted; display update skipped");
-    gShownKey = clockOk ? dateKey(now) : kShownFallback;
+    gShownKey = wantedKey(clockOk, now);
   } else {
-    if (gShownKey == (clockOk ? dateKey(now) : kShownFallback)) {
-      Serial.println("[calendar] Page already current");
-    }
+    if (gShownKey == wantedKey(clockOk, now)) Serial.println("[calendar] Page already current");
     updateDisplay(clockOk, now);
   }
+  if (buttonWake) onButton(Action::Wake, clockOk, now);
 
   if (gClock == ClockSource::Internal) return;  // loop() takes over.
 
-  if (!clockOk) sleepFor(kRetrySeconds);
+  // Stay awake while the buttons are in use after the wake key or power-on.
+  if (!faulted && (coldStart || buttonWake)) {
+    uint32_t lastActive = millis();
+    while (millis() - lastActive < kSessionIdleMs) {
+      if (service()) lastActive = millis();
+      delay(20);
+    }
+  }
   // Re-read so time spent refreshing is accounted for.
   if (!readClock(now)) sleepFor(kRetrySeconds);
-  const uint32_t remaining = secondsUntilNextDay(now, kRefreshOffsetSeconds);
-  sleepFor(remaining > kShortSleepSeconds ? remaining / 10 * 9 : remaining);
+  sleepFor(sleepSeconds(now));
 }
 
 // Only reached in internal-clock mode; DS3231 mode always ends setup() in deep sleep.
 void loop() {
-  esp_task_wdt_reset();
-  pollSerial();
-  LocalTime now;
-  const bool clockOk = readClock(now);
-  const uint32_t wanted = clockOk ? dateKey(now) : kShownFallback;
-  if (wanted != gShownKey) {
-    logClock(clockOk, now);
-    updateDisplay(clockOk, now);
-  }
-  delay(200);
+  service();
+  delay(20);
 }

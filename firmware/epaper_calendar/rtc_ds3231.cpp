@@ -121,3 +121,13 @@ LocalTime fromEpochSeconds(int64_t seconds) {
           static_cast<uint8_t>(rem / 3600), static_cast<uint8_t>(rem / 60 % 60),
           static_cast<uint8_t>(rem % 60)};
 }
+
+LocalTime addMonths(const LocalTime &t, int months) {
+  const int index = t.year * 12 + (t.month - 1) + months;
+  LocalTime r = t;
+  r.year = static_cast<uint16_t>(index / 12);
+  r.month = static_cast<uint8_t>(index % 12 + 1);
+  const uint8_t last = daysInMonth(r.year, r.month);
+  if (r.day > last) r.day = last;
+  return r;
+}

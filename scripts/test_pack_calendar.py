@@ -1,5 +1,6 @@
 """Tests for pack_calendar.py and generate_pages.py. Run: python3 -m unittest discover -s scripts"""
 
+import re
 import struct
 import tempfile
 import unittest
@@ -44,6 +45,15 @@ class Blob(unittest.TestCase):
         self.assertEqual(pc.partition_size(), 0x2B0000)
 
 
+class MonthView(unittest.TestCase):
+    def test_firmware_grid_matches_generator(self):
+        sketch = (pc.ROOT / "firmware/epaper_calendar/epaper_calendar.ino").read_text()
+        found = {name.lower(): int(value) for name, value in
+                 re.findall(r"constexpr int kMonthGrid(\w+) = (\d+);", sketch)}
+        self.assertEqual(found, {"left": gp.MONTH_GRID_LEFT, "right": gp.MONTH_GRID_RIGHT,
+                                 "top": gp.MONTH_GRID_TOP, "bottom": gp.MONTH_GRID_BOTTOM})
+
+
 class EndToEnd(unittest.TestCase):
     def test_generated_pages_pack_within_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,17 +63,21 @@ class EndToEnd(unittest.TestCase):
             gp.main(["-o", str(pages_dir), "--start", "2028-02-29", "--days", "1"])
             pc.main([str(pages_dir), "-o", str(out)])
             pages = pc.read_blob(out.read_bytes())
-            self.assertEqual(sorted(pages), [0, 20270530, 20270531, 20270601, 20280229])
-            sizes = [pc.ENTRY.unpack_from(out.read_bytes(), 16 + 16 * i)[2] for i in range(len(pages))]
-            # 365 pages must fit the partition; keep generated pages well under the average budget.
-            self.assertLess(max(sizes), pc.partition_size() // 366)
+            self.assertEqual(sorted(pages), [0, 20270500, 20270530, 20270531, 20270600, 20270601,
+                                             20280200, 20280229])
+            entries = [pc.ENTRY.unpack_from(out.read_bytes(), 16 + 16 * i) for i in range(len(pages))]
+            sizes = {key: length for key, _, length, _ in entries}
+            # 365 day pages plus 13 month views must fit; keep each well under the average budget.
+            self.assertLess(max(sizes.values()), pc.partition_size() // (366 + 13))
 
     def test_rejects_duplicate_and_ignores_unrelated_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             Image.new("RGB", (800, 480), "white").save(d / "2026-11-09.png")
             Image.new("RGB", (800, 480), "white").save(d / "notes.png")
-            self.assertEqual(list(pc.collect(d)), [20261109])
+            Image.new("RGB", (800, 480), "white").save(d / "2026-11.png")
+            Image.new("RGB", (800, 480), "white").save(d / "2026-13.png")
+            self.assertEqual(sorted(pc.collect(d)), [20261100, 20261109])
             Image.new("RGB", (800, 480), "white").save(d / "2026-11-09.jpg")
             with self.assertRaises(ValueError):
                 pc.collect(d)

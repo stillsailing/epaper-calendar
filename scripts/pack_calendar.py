@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Pack dated calendar pages into the firmware's "calendar" flash partition.
 
-Input is a directory of images named YYYY-MM-DD.png (or .jpg/.bmp), plus an
-optional fallback.png shown when the clock is unset or a date has no page.
+Input is a directory of images named YYYY-MM-DD.png (or .jpg/.bmp), month views
+named YYYY-MM.png, plus an optional fallback.png shown when the clock is unset or
+a date has no page.
 Each page is quantized with convert_image.py, packed two pixels per byte in
 the panel's own 4-bit codes, and zlib-compressed.
 
 Blob layout (little-endian), read by calendar_store.cpp:
   header  16 B: "ECAL", u16 version=1, u16 count, u16 width, u16 height, u32 total size
-  entries 16 B each, sorted by date: u32 YYYYMMDD (0 = fallback), u32 offset,
+  entries 16 B each, sorted by key: u32 YYYYMMDD (YYYYMM00 = month view,
+          0 = fallback), u32 offset,
           u32 compressed length, u32 CRC-32 of the compressed bytes
   pages   zlib streams, each inflating to 192,000 bytes
 """
@@ -38,6 +40,7 @@ PAGE_BYTES = ci.WIDTH * ci.HEIGHT // 2
 PANEL_NIBBLE = {0x00: 0x0, 0xFF: 0x1, 0xFC: 0x2, 0xE0: 0x3, 0x03: 0x5, 0x1C: 0x6}
 CODE_BY_NIBBLE = {nibble: code for code, nibble in PANEL_NIBBLE.items()}
 NAME_PATTERN = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+MONTH_PATTERN = re.compile(r"(\d{4})-(\d{2})")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
 
 
@@ -101,19 +104,21 @@ def partition_size(name="calendar", path=PARTITIONS):
 
 
 def collect(directory):
-    """Return {date_key or FALLBACK_DATE: path}."""
+    """Return {date key, month key (YYYYMM00) or FALLBACK_DATE: path}."""
     found = {}
     for path in sorted(directory.iterdir()):
         if path.suffix.lower() not in IMAGE_SUFFIXES:
             continue
         if path.stem == "fallback":
             key = FALLBACK_DATE
-        else:
-            match = NAME_PATTERN.fullmatch(path.stem)
-            if not match:
-                print(f"skipping {path.name}: name is not YYYY-MM-DD or fallback", file=sys.stderr)
-                continue
+        elif match := NAME_PATTERN.fullmatch(path.stem):
             key = date_key(date(*map(int, match.groups())))
+        elif (match := MONTH_PATTERN.fullmatch(path.stem)) and 1 <= int(match[2]) <= 12:
+            key = int(match[1]) * 10000 + int(match[2]) * 100
+        else:
+            print(f"skipping {path.name}: name is not YYYY-MM-DD, YYYY-MM or fallback",
+                  file=sys.stderr)
+            continue
         if key in found:
             raise ValueError(f"two images for the same date: {found[key].name}, {path.name}")
         found[key] = path
@@ -122,7 +127,7 @@ def collect(directory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("pages", type=Path, help="directory of YYYY-MM-DD.png and optional fallback.png")
+    parser.add_argument("pages", type=Path, help="directory of YYYY-MM-DD.png, YYYY-MM.png and optional fallback.png")
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--fit", choices=ci.FITS, default="exact")
     parser.add_argument("--rotate", type=int, choices=sorted(ci.ROTATIONS), default=0)
@@ -144,9 +149,11 @@ def main(argv=None):
     except (OSError, ValueError) as error:
         parser.exit(1, f"error: {error}\n")
 
-    dated = sorted(k for k in pages if k != FALLBACK_DATE)
+    dated = sorted(k for k in pages if k % 100)
+    months = len(pages) - len(dated) - (FALLBACK_DATE in pages)
     sizes = [ENTRY.unpack_from(blob, HEADER.size + i * ENTRY.size)[2] for i in range(len(pages))]
-    print(f"{len(dated)} dated pages" + (" + fallback" if FALLBACK_DATE in pages else " (no fallback)"))
+    print(f"{len(dated)} dated pages, {months} month views"
+          + (" + fallback" if FALLBACK_DATE in pages else " (no fallback)"))
     if dated:
         first, last = (date(k // 10000, k // 100 % 100, k % 100) for k in (dated[0], dated[-1]))
         missing = (last - first).days + 1 - len(dated)

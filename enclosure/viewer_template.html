@@ -1,0 +1,468 @@
+<title>日历相框模型</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<style>
+/* Template for enclosure/build_viewer.py, which fills in MODEL and writes
+   enclosure/viewer.html. Layout: a 3D stage beside a narrow spec
+   sheet (stacked on phones). Part colors are the panel's six e-paper inks. */
+:root {
+  --bg: #eceef1;
+  --surface: #f7f8f9;
+  --stage: #e2e5e9;
+  --fg: #1b1f24;
+  --muted: #5b6570;
+  --line: #d3d8de;
+  --accent: #2c5aa8;
+  --warn: #9a6b12;
+  --warn-bg: #f6ecd2;
+  --grid-major: #c3c9d0;
+  --grid-minor: #d6dbe0;
+  --font-display: "Barlow Condensed", "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  --font-body: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14171a; --surface: #1b1f23; --stage: #0f1214; --fg: #e5e8eb; --muted: #98a2ad;
+    --line: #2b3137; --accent: #86a8e4; --warn: #e3bd62; --warn-bg: #2f2817;
+    --grid-major: #2f363d; --grid-minor: #1e2429; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14171a; --surface: #1b1f23; --stage: #0f1214; --fg: #e5e8eb; --muted: #98a2ad;
+  --line: #2b3137; --accent: #86a8e4; --warn: #e3bd62; --warn-bg: #2f2817;
+  --grid-major: #2f363d; --grid-minor: #1e2429; color-scheme: dark;
+}
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.55 var(--font-body);
+}
+.app {
+  box-sizing: border-box; height: 100%;
+  display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px;
+  padding-inline: 16px; padding-block: 16px;
+}
+.stage {
+  position: relative; min-width: 0; min-height: 0;
+  background: var(--stage); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+#view { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+#view:active { cursor: grabbing; }
+.views {
+  position: absolute; top: 12px; left: 12px; display: flex; flex-wrap: wrap; gap: 6px;
+}
+.hint {
+  position: absolute; left: 12px; bottom: 10px; margin: 0;
+  font-size: 12px; color: var(--muted); pointer-events: none;
+}
+.tip {
+  position: absolute; pointer-events: none; padding: 3px 8px; border-radius: 4px;
+  background: var(--fg); color: var(--bg); font-size: 12px; white-space: nowrap;
+  transform: translate(12px, -50%);
+}
+button, .seg label {
+  font: 500 13px/1 var(--font-body); color: var(--fg);
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+  padding: 7px 10px; cursor: pointer;
+}
+button:hover, .seg label:hover { border-color: var(--accent); }
+button:focus-visible, input:focus-visible + span, .seg input:focus-visible + label {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.panel {
+  min-width: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 18px;
+  padding-right: 4px;
+}
+.panel header { display: grid; gap: 2px; }
+.eyebrow {
+  margin: 0; font-size: 12px; letter-spacing: 0.04em; color: var(--muted);
+}
+h1 {
+  margin: 0; font: 600 34px/1.05 var(--font-display); letter-spacing: 0.01em; text-wrap: balance;
+}
+.dims {
+  margin: 4px 0 0; font: 500 22px/1.2 var(--font-display);
+  font-variant-numeric: tabular-nums; color: var(--accent);
+}
+.dims small { font-size: 14px; color: var(--muted); }
+h2 {
+  margin: 0 0 8px; font: 600 13px/1.2 var(--font-body); letter-spacing: 0.06em; color: var(--muted);
+}
+.seg { display: flex; gap: 0; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label { flex: 1; text-align: center; border-radius: 0; }
+.seg label:first-of-type { border-radius: 6px 0 0 6px; }
+.seg label:last-of-type { border-radius: 0 6px 6px 0; border-left: 0; }
+.seg input:checked + label { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.parts { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.parts label {
+  display: grid; grid-template-columns: 18px 14px 1fr auto; align-items: center; gap: 8px;
+  padding: 6px 4px; border-radius: 6px; cursor: pointer;
+}
+.parts label:hover { background: var(--surface); }
+.parts input { margin: 0; accent-color: var(--accent); }
+.swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); }
+.parts .note { font-size: 12px; color: var(--muted); }
+.slider { display: grid; grid-template-columns: 1fr 64px; align-items: center; gap: 10px; }
+.slider input { width: 100%; accent-color: var(--accent); }
+.slider output {
+  font: 500 16px/1 var(--font-display); font-variant-numeric: tabular-nums; text-align: right;
+}
+.check { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: pointer; }
+.check input { margin: 0; accent-color: var(--accent); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td { padding: 5px 0; border-bottom: 1px solid var(--line); }
+td.num {
+  text-align: right; font: 500 15px/1 var(--font-display); font-variant-numeric: tabular-nums;
+}
+.todo { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.todo li {
+  display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: baseline;
+  padding: 7px 9px; border-radius: 6px; background: var(--warn-bg); font-size: 13px;
+}
+.todo .num { font: 500 15px/1 var(--font-display); font-variant-numeric: tabular-nums; color: var(--warn); }
+.panel footer { margin-top: auto; font-size: 12px; color: var(--muted); }
+code { font-size: 12px; }
+@media (max-width: 760px) {
+  html, body { height: auto; }
+  .app { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .stage { height: 62vh; min-height: 340px; }
+  .panel { overflow: visible; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="app">
+  <section class="stage" aria-label="3D 模型">
+    <canvas id="view"></canvas>
+    <div class="views" role="toolbar" aria-label="视角">
+      <button type="button" data-view="front">正面</button>
+      <button type="button" data-view="back">背面</button>
+      <button type="button" data-view="side">侧面</button>
+      <button type="button" data-view="iso">斜视</button>
+    </div>
+    <div class="tip" id="tip" hidden></div>
+    <p class="hint">拖动旋转 · 滚轮或双指缩放 · 右键或双指拖动平移</p>
+  </section>
+
+  <aside class="panel">
+    <header>
+      <p class="eyebrow">GDEP073E01 · 7.3 寸六色墨水屏</p>
+      <h1>日历相框</h1>
+      <p class="dims" id="dims"></p>
+    </header>
+
+    <section>
+      <h2>摆放</h2>
+      <div class="seg">
+        <input type="radio" name="pose" id="pose-desk" value="desk" checked>
+        <label for="pose-desk">立在支架上</label>
+        <input type="radio" name="pose" id="pose-flat" value="flat">
+        <label for="pose-flat">平放（正面朝下）</label>
+      </div>
+    </section>
+
+    <section>
+      <h2>零件</h2>
+      <ul class="parts" id="parts"></ul>
+    </section>
+
+    <section>
+      <h2>分解</h2>
+      <div class="slider">
+        <input type="range" id="explode" min="0" max="40" step="1" value="0" aria-label="分解间距">
+        <output id="explode-out" for="explode">0 mm</output>
+      </div>
+    </section>
+
+    <section>
+      <h2>剖切</h2>
+      <label class="check"><input type="checkbox" id="clip-on"><span>沿宽度方向切开看内部</span></label>
+      <div class="slider">
+        <input type="range" id="clip" min="-100" max="100" step="0.5" value="0" disabled aria-label="剖切位置">
+        <output id="clip-out" for="clip">0 mm</output>
+      </div>
+    </section>
+
+    <section>
+      <h2>层叠（从前到后）</h2>
+      <table><tbody id="stack"></tbody></table>
+    </section>
+
+    <section>
+      <h2>打印前要实测</h2>
+      <ul class="todo" id="todo"></ul>
+    </section>
+
+    <footer id="source"></footer>
+  </aside>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.146.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.146.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.146.0/examples/js/loaders/STLLoader.js"></script>
+<script>
+const MODEL = /*@MODEL@*/null;
+const P = MODEL.params;
+const mm = (v) => (Math.round(v * 10) / 10).toString();
+
+// ---- Spec sheet -------------------------------------------------------------
+const PARTS = [
+  { key: "frame", name: "边框", color: 0x24272b, note: "打印 1 件", layer: 0 },
+  { key: "keypad", name: "按键模块", color: 0xc2392f, note: "占位", layer: 0 },
+  { key: "panel", name: "屏幕", color: 0xf3f2ec, note: "占位", layer: 1 },
+  { key: "plate", name: "托板", color: 0xe0b43a, note: "打印 1 件", layer: 2 },
+  { key: "boards", name: "电路板", color: 0xc2392f, note: "占位", layer: 2 },
+  { key: "lid", name: "后盖", color: 0x2f62b4, note: "打印 1 件", layer: 3, opacity: 0.45 },
+  { key: "foot", name: "支架", color: 0x3b8b58, note: "打印 2 件", layer: null },
+];
+const hex = (c) => "#" + c.toString(16).padStart(6, "0");
+
+document.getElementById("dims").innerHTML =
+  `${mm(P.outer[0])} × ${mm(P.outer[1])} × ${mm(P.outer[2])} <small>mm</small>`;
+
+const partsList = document.getElementById("parts");
+for (const part of PARTS) {
+  const li = document.createElement("li");
+  li.innerHTML = `<label><input type="checkbox" id="show-${part.key}" checked>` +
+    `<span class="swatch" style="background:${hex(part.color)}"></span>` +
+    `<span>${part.name}</span><span class="note">${part.note}</span></label>`;
+  partsList.append(li);
+}
+
+const [faceT, panelT, foamT, plateT, elecH, lidT] = P.stack;
+document.getElementById("stack").innerHTML = [
+  ["边框正面", faceT], ["屏幕", panelT], ["泡棉双面胶", foamT], ["托板", plateT],
+  ["电路板、线材、电池空间", elecH], ["后盖", lidT],
+].map(([name, t]) => `<tr><td>${name}</td><td class="num">${mm(t)} mm</td></tr>`).join("") +
+  `<tr><td><b>合计</b></td><td class="num"><b>${mm(P.outer[2])} mm</b></td></tr>`;
+
+const b1 = P.esp32_board, b2 = P.adapter_board;
+document.getElementById("todo").innerHTML = [
+  ["显示区（假定居中）", `${mm(P.active[0])} × ${mm(P.active[1])}`],
+  ["排线出口宽度", `${mm(P.fpc_w)}`],
+  ["ESP32-L 板", `${mm(b1[0])} × ${mm(b1[1])}`],
+  ["DESPI-C73 转接板", `${mm(b2[0])} × ${mm(b2[1])}`],
+  ["按键模块", `${mm(P.keypad[0])} × ${mm(P.keypad[1])}`],
+].map(([name, v]) => `<li><span>${name}</span><span class="num">${v} mm</span></li>`).join("");
+
+document.getElementById("source").innerHTML =
+  `由 <code>enclosure/calendar_frame.scad</code> 生成 · ${MODEL.generated}` +
+  (MODEL.pageDate ? ` · 屏幕显示 ${MODEL.pageDate} 的页面` : "");
+
+// ---- Scene ------------------------------------------------------------------
+const canvas = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.localClippingEnabled = true;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, 1, 1, 5000);
+const controls = new THREE.OrbitControls(camera, canvas);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8d939c, 0.85));
+const key = new THREE.DirectionalLight(0xffffff, 0.75);
+key.position.set(180, 320, 260);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0xffffff, 0.35);
+rim.position.set(-260, 120, -220);
+scene.add(rim);
+
+// OpenSCAD is Z-up; three.js is Y-up. Inside `root`, coordinates are the model's.
+const root = new THREE.Group();
+root.rotation.x = -Math.PI / 2;
+scene.add(root);
+const assembly = new THREE.Group();
+assembly.matrixAutoUpdate = false;
+root.add(assembly);
+const feet = new THREE.Group();
+root.add(feet);
+
+const clipPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 1e5);
+const loader = new THREE.STLLoader();
+function geometry(key) {
+  const bin = atob(MODEL.parts[key]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return loader.parse(bytes.buffer);
+}
+
+const pickable = [];
+function partMesh(part, geo) {
+  const group = new THREE.Group();
+  const transparent = part.opacity !== undefined;
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    color: part.color, roughness: 0.78, metalness: 0, side: THREE.DoubleSide,
+    transparent, opacity: part.opacity ?? 1, depthWrite: !transparent,
+    clippingPlanes: [clipPlane], polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+  }));
+  mesh.userData.name = part.name;
+  pickable.push(mesh);
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 25), new THREE.LineBasicMaterial({
+    color: part.key === "frame" ? 0x6b7078 : 0x15181b, transparent: true, opacity: 0.35,
+    clippingPlanes: [clipPlane],
+  }));
+  group.add(mesh, edges);
+  return group;
+}
+
+const groups = {};
+for (const part of PARTS) {
+  if (part.key === "foot") continue;
+  groups[part.key] = partMesh(part, geometry(part.key));
+  assembly.add(groups[part.key]);
+}
+
+// The calendar page on the screen's active area, facing the viewer (-Z).
+if (MODEL.page) {
+  const tex = new THREE.TextureLoader().load(MODEL.page);
+  if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace; else tex.encoding = THREE.sRGBEncoding;
+  const page = new THREE.Mesh(
+    new THREE.PlaneGeometry(P.active[0], P.active[1]),
+    new THREE.MeshBasicMaterial({ map: tex, clippingPlanes: [clipPlane], toneMapped: false }));
+  page.rotation.y = Math.PI;
+  page.position.set(P.active[2], P.active[3], P.z[0] - 0.05);
+  page.userData.name = "屏幕显示区";
+  pickable.push(page);
+  groups.panel.add(page);
+}
+
+const footPart = PARTS.find((p) => p.key === "foot");
+const footGeo = geometry("foot");
+const [footW, , , slot, pivotY, pivotZ, tilt] = P.foot;
+for (const side of [-1, 1]) {
+  const f = partMesh(footPart, footGeo);
+  f.position.x = side * (P.outer[0] / 2 - 35) - footW / 2;
+  feet.add(f);
+}
+
+// Frame coordinates → standing in the feet: thickness along the slot,
+// bottom edge on the slot floor, leaning back by `tilt`.
+function deskMatrix() {
+  const seat = new THREE.Matrix4().set(
+    -1, 0, 0, 0,
+    0, 0, 1, -slot + 0.3,
+    0, 1, 0, P.outer[1] / 2,
+    0, 0, 0, 1);
+  return new THREE.Matrix4().makeTranslation(0, pivotY, pivotZ)
+    .multiply(new THREE.Matrix4().makeRotationX(-tilt * Math.PI / 180))
+    .multiply(seat);
+}
+
+const grid = new THREE.GridHelper(600, 60);
+grid.material.transparent = true;
+scene.add(grid);
+
+// ---- State ------------------------------------------------------------------
+let pose = "desk";
+function applyPose() {
+  assembly.matrix.copy(pose === "desk" ? deskMatrix() : new THREE.Matrix4());
+  assembly.matrixWorldNeedsUpdate = true;
+  feet.visible = pose === "desk" && document.getElementById("show-foot").checked;
+}
+function applyExplode() {
+  const gap = +document.getElementById("explode").value;
+  document.getElementById("explode-out").textContent = `${gap} mm`;
+  for (const part of PARTS) if (part.layer !== null) groups[part.key].position.z = part.layer * gap;
+}
+function applyVisibility() {
+  for (const part of PARTS) {
+    const on = document.getElementById(`show-${part.key}`).checked;
+    if (part.key === "foot") feet.visible = on && pose === "desk";
+    else groups[part.key].visible = on;
+  }
+}
+function applyClip() {
+  const on = document.getElementById("clip-on").checked;
+  const input = document.getElementById("clip");
+  input.disabled = !on;
+  document.getElementById("clip-out").textContent = on ? `${input.value} mm` : "关";
+  clipPlane.constant = on ? +input.value : 1e5;
+}
+
+const VIEWS = {
+  front: [0, 0.12, 1], back: [0, 0.2, -1], side: [1, 0.12, 0.02], iso: [0.85, 0.55, 1],
+};
+function setView(name) {
+  scene.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(root);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  const dir = new THREE.Vector3(...VIEWS[name]).normalize();
+  const dist = size / 2 / Math.tan((camera.fov * Math.PI) / 360) * 1.05;
+  camera.position.copy(center).addScaledVector(dir, dist);
+  controls.target.copy(center);
+  controls.update();
+}
+
+for (const input of document.querySelectorAll("input[name=pose]")) {
+  input.addEventListener("change", () => { pose = input.value; applyPose(); setView("iso"); });
+}
+for (const part of PARTS) document.getElementById(`show-${part.key}`).addEventListener("change", applyVisibility);
+document.getElementById("explode").addEventListener("input", applyExplode);
+document.getElementById("clip-on").addEventListener("change", applyClip);
+document.getElementById("clip").addEventListener("input", applyClip);
+for (const button of document.querySelectorAll("[data-view]")) {
+  button.addEventListener("click", () => setView(button.dataset.view));
+}
+const clipInput = document.getElementById("clip");
+clipInput.min = String(-Math.ceil(P.outer[0] / 2));
+clipInput.max = String(Math.ceil(P.outer[0] / 2));
+
+// ---- Hover labels -----------------------------------------------------------
+const tip = document.getElementById("tip");
+const ray = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+canvas.addEventListener("pointermove", (e) => {
+  if (e.buttons) { tip.hidden = true; return; }
+  const r = canvas.getBoundingClientRect();
+  pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(pointer, camera);
+  const hit = ray.intersectObjects(pickable.filter((m) => {
+    let o = m; while (o) { if (!o.visible) return false; o = o.parent; } return true;
+  }), false).find((h) => clipPlane.distanceToPoint(h.point) >= 0);
+  tip.hidden = !hit;
+  if (hit) {
+    tip.textContent = hit.object.userData.name;
+    tip.style.left = `${e.clientX - r.left}px`;
+    tip.style.top = `${e.clientY - r.top}px`;
+  }
+});
+canvas.addEventListener("pointerleave", () => { tip.hidden = true; });
+
+// ---- Theme & size -----------------------------------------------------------
+function applyTheme() {
+  const css = getComputedStyle(document.documentElement);
+  const color = (name) => new THREE.Color(css.getPropertyValue(name).trim());
+  scene.background = color("--stage");
+  // GridHelper: 4 vertices per division; every 10th (100 mm) is a major line.
+  const colors = grid.geometry.getAttribute("color");
+  const c1 = color("--grid-major"), c2 = color("--grid-minor");
+  for (let i = 0; i < colors.count; i++) {
+    const c = Math.floor(i / 4) % 10 === 0 ? c1 : c2;
+    colors.setXYZ(i, c.r, c.g, c.b);
+  }
+  colors.needsUpdate = true;
+}
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+function resize() {
+  const { clientWidth: w, clientHeight: h } = canvas.parentElement;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / Math.max(h, 1);
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(canvas.parentElement);
+
+applyTheme();
+applyPose();
+applyExplode();
+applyVisibility();
+applyClip();
+resize();
+setView("iso");
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>

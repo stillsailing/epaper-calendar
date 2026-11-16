@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render one 800 x 480 calendar page per day, plus fallback.png.
+"""Render one 800 x 480 calendar page per day, a month view per month, and fallback.png.
 
 Output feeds pack_calendar.py. Pages use only the panel's six pure colors and
 text is drawn without anti-aliasing, so quantization keeps every pixel exact.
@@ -41,6 +41,9 @@ MONTHS_EN = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
              "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]
 WEEKDAYS_EN = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
 MONTHS_CN = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二"]
+# Month-view grid area. The firmware frames today's cell from the same numbers
+# (kMonthGrid* in epaper_calendar.ino; test_pack_calendar.py checks they match).
+MONTH_GRID_LEFT, MONTH_GRID_RIGHT, MONTH_GRID_TOP, MONTH_GRID_BOTTOM = 40, 760, 116, 436
 
 _font_cache = {}
 
@@ -233,6 +236,53 @@ def poster(today, lookahead, month):
 STYLES = {"almanac": almanac, "grid": grid, "poster": poster}
 
 
+def render_month(year, month):
+    """Whole-month view (YYYY-MM.png), in the almanac style; the firmware's month key shows it
+    and draws a frame around today's cell."""
+    days = info.month_days(year, month)
+    first, last = days[0], days[-1]
+    image, draw = canvas()
+
+    draw.text((40, 44), str(year), font=font("bodoni", 34), fill=BLACK, anchor="ls")
+    draw.text((400, 44), f"{MONTHS_CN[month - 1]}月  {MONTHS_EN[month - 1]}",
+              font=font("song_bold", 26), fill=BLACK, anchor="ms")
+    draw.text((760, 44), f"{first.lunar.year_name}{first.lunar.zodiac}年",
+              font=font("song_bold", 26), fill=BLACK, anchor="rs")
+    draw.rectangle((40, 60, 760, 63), fill=BLACK)
+    draw.rectangle((40, 67, 760, 67), fill=BLACK)
+
+    left, cell_w = MONTH_GRID_LEFT, (MONTH_GRID_RIGHT - MONTH_GRID_LEFT) / 7
+    for col, name in enumerate(info.WEEKDAYS):
+        draw.text((left + (col + 0.5) * cell_w, 100), name, font=font("song_bold", 22),
+                  fill=RED if col >= 5 else BLACK, anchor="ms")
+    draw.rectangle((40, 110, 760, 110), fill=BLACK)
+
+    first_col = first.day.weekday()
+    rows = (first_col + len(days) + 6) // 7
+    top0, row_h = MONTH_GRID_TOP, (MONTH_GRID_BOTTOM - MONTH_GRID_TOP) / rows
+    for item in days:
+        index = first_col + item.day.day - 1
+        col, row = index % 7, index // 7
+        cx, top = left + (col + 0.5) * cell_w, top0 + row * row_h
+        if item.major:
+            draw.rectangle((cx - cell_w / 2 + 4, top + 3, cx + cell_w / 2 - 4, top + row_h - 3),
+                           fill=YELLOW)
+        number_color = RED if col >= 5 or item.major else BLACK
+        draw.text((cx, top + row_h * 0.56), str(item.day.day),
+                  font=font("bodoni", 34 if rows == 5 else 30), fill=number_color, anchor="ms")
+        label = item.short_label
+        draw.text((cx, top + row_h * 0.88), label if len(label) <= 4 else label[:4],
+                  font=font("hei", 15), fill=RED if item.highlight else BLACK, anchor="ms")
+
+    draw.rectangle((40, 444, 760, 445), fill=BLACK)
+    draw.text((40, 468), f"农历 {first.lunar.month_name}{first.lunar.day_name} 至 "
+              f"{last.lunar.month_name}{last.lunar.day_name}", font=font("hei", 18), fill=BLACK,
+              anchor="ls")
+    terms = " · ".join(f"{d.term} {d.day.day} 日" for d in days if d.term)
+    draw.text((760, 468), terms, font=font("hei_bold", 18), fill=RED, anchor="rs")
+    return image
+
+
 def render_fallback():
     """Shown when the clock is unset or a date has no page; matches the almanac style."""
     image, draw = canvas()
@@ -284,11 +334,15 @@ def main(argv=None):
 
     args.output.mkdir(parents=True, exist_ok=True)
     render_fallback().save(args.output / "fallback.png")
+    months = set()
     for day, image in render_range(args.start, args.days, args.style):
         image.save(args.output / f"{day.isoformat()}.png")
+        months.add((day.year, day.month))
+    for year, month in sorted(months):
+        render_month(year, month).save(args.output / f"{year}-{month:02d}.png")
     last = args.start + timedelta(days=args.days - 1)
-    print(f"wrote {args.days} {args.style} pages ({args.start} .. {last}) and fallback.png "
-          f"to {args.output}")
+    print(f"wrote {args.days} {args.style} pages ({args.start} .. {last}), {len(months)} month "
+          f"views and fallback.png to {args.output}")
 
 
 if __name__ == "__main__":
