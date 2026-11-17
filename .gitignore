@@ -6,3 +6,10 @@
 *.map
 *.log
 __pycache__/
+
+# Local Python environments and credentials
+.venv/
+venv/
+.env
+.env.*
+!.env.example
